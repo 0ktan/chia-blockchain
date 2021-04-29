@@ -360,7 +360,7 @@ wallet:
 
   full_node_peer:
     host: *self_hostname
-    port: 8444
+    port: 58444
 
   testing: False
   database_path: wallet/db/blockchain_wallet_v1_CHALLENGE_KEY.sqlite
