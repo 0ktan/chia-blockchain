@@ -71,6 +71,7 @@ class MempoolManager:
         # The mempool will correspond to a certain peak
         self.peak: Optional[BlockRecord] = None
         self.mempool: Mempool = Mempool(self.mempool_max_total_cost)
+        self.lock = asyncio.Lock()
 
     def shut_down(self):
         self.pool.shutdown(wait=True)
@@ -82,48 +83,49 @@ class MempoolManager:
         Returns aggregated spendbundle that can be used for creating new block,
         additions and removals in that spend_bundle
         """
-        if (
-            self.peak is None
-            or self.peak.header_hash != peak_header_hash
-            or int(time.time()) <= self.constants.INITIAL_FREEZE_END_TIMESTAMP
-        ):
-            return None
+        async with self.lock:
+            if (
+                self.peak is None
+                or self.peak.header_hash != peak_header_hash
+                or int(time.time()) <= self.constants.INITIAL_FREEZE_END_TIMESTAMP
+            ):
+                return None
 
-        cost_sum = 0  # Checks that total cost does not exceed block maximum
-        fee_sum = 0  # Checks that total fees don't exceed 64 bits
-        spend_bundles: List[SpendBundle] = []
-        removals = []
-        additions = []
-        broke_from_inner_loop = False
-        log.info(f"Starting to make block, max cost: {self.constants.MAX_BLOCK_COST_CLVM}")
-        for dic in self.mempool.sorted_spends.values():
-            if broke_from_inner_loop:
-                break
-            for item in dic.values():
-                log.info(f"Cumulative cost: {cost_sum}")
-                if (
-                    item.cost + cost_sum <= self.limit_factor * self.constants.MAX_BLOCK_COST_CLVM
-                    and item.fee + fee_sum <= self.constants.MAX_COIN_AMOUNT
-                ):
-                    spend_bundles.append(item.spend_bundle)
-                    cost_sum += item.cost
-                    fee_sum += item.fee
-                    removals.extend(item.removals)
-                    additions.extend(item.additions)
-                else:
-                    broke_from_inner_loop = True
+            cost_sum = 0  # Checks that total cost does not exceed block maximum
+            fee_sum = 0  # Checks that total fees don't exceed 64 bits
+            spend_bundles: List[SpendBundle] = []
+            removals = []
+            additions = []
+            broke_from_inner_loop = False
+            log.info(f"Starting to make block, max cost: {self.constants.MAX_BLOCK_COST_CLVM}")
+            for dic in self.mempool.sorted_spends.values():
+                if broke_from_inner_loop:
                     break
-        if len(spend_bundles) > 0:
-            log.info(
-                f"Cumulative cost of block (real cost should be less) {cost_sum}. Proportion "
-                f"full: {cost_sum / self.constants.MAX_BLOCK_COST_CLVM}"
-            )
-            agg = SpendBundle.aggregate(spend_bundles)
-            assert set(agg.additions()) == set(additions)
-            assert set(agg.removals()) == set(removals)
-            return agg, additions, removals
-        else:
-            return None
+                for item in dic.values():
+                    log.info(f"Cumulative cost: {cost_sum}")
+                    if (
+                        item.cost + cost_sum <= self.limit_factor * self.constants.MAX_BLOCK_COST_CLVM
+                        and item.fee + fee_sum <= self.constants.MAX_COIN_AMOUNT
+                    ):
+                        spend_bundles.append(item.spend_bundle)
+                        cost_sum += item.cost
+                        fee_sum += item.fee
+                        removals.extend(item.removals)
+                        additions.extend(item.additions)
+                    else:
+                        broke_from_inner_loop = True
+                        break
+            if len(spend_bundles) > 0:
+                log.info(
+                    f"Cumulative cost of block (real cost should be less) {cost_sum}. Proportion "
+                    f"full: {cost_sum / self.constants.MAX_BLOCK_COST_CLVM}"
+                )
+                agg = SpendBundle.aggregate(spend_bundles)
+                assert set(agg.additions()) == set(additions)
+                assert set(agg.removals()) == set(removals)
+                return agg, additions, removals
+            else:
+                return None
 
     def get_filter(self) -> bytes:
         all_transactions: Set[bytes32] = set()
@@ -221,6 +223,24 @@ class MempoolManager:
         return NPCResult.from_bytes(cached_result_bytes)
 
     async def add_spendbundle(
+        self,
+        new_spend: SpendBundle,
+        npc_result: NPCResult,
+        spend_name: bytes32,
+        validate_signature=True,
+        program: Optional[SerializedProgram] = None,
+        locked: bool = False,
+    ) -> Tuple[Optional[uint64], MempoolInclusionStatus, Optional[Err]]:
+        if not locked:
+            await self.lock.acquire()
+        try:
+            result = await self._add_spendbundle(new_spend, npc_result, spend_name, validate_signature, program)
+            return result
+        finally:
+            if locked is False:
+                self.lock.release()
+
+    async def _add_spendbundle(
         self,
         new_spend: SpendBundle,
         npc_result: NPCResult,
@@ -489,38 +509,41 @@ class MempoolManager:
         """
         Called when a new peak is available, we try to recreate a mempool for the new tip.
         """
-        if new_peak is None:
-            return []
-        if new_peak.is_transaction_block is False:
-            return []
-        if self.peak == new_peak:
-            return []
-        assert new_peak.timestamp is not None
-        if new_peak.timestamp <= self.constants.INITIAL_FREEZE_END_TIMESTAMP:
-            return []
+        async with self.lock:
+            if new_peak is None:
+                return []
+            if new_peak.is_transaction_block is False:
+                return []
+            if self.peak == new_peak:
+                return []
+            assert new_peak.timestamp is not None
+            if new_peak.timestamp <= self.constants.INITIAL_FREEZE_END_TIMESTAMP:
+                return []
 
-        self.peak = new_peak
+            self.peak = new_peak
 
-        old_pool = self.mempool
-        self.mempool = Mempool(self.mempool_max_total_cost)
+            old_pool = self.mempool
+            self.mempool = Mempool(self.mempool_max_total_cost)
 
-        for item in old_pool.spends.values():
-            await self.add_spendbundle(item.spend_bundle, item.npc_result, item.spend_bundle_name, False, item.program)
+            for item in old_pool.spends.values():
+                await self.add_spendbundle(
+                    item.spend_bundle, item.npc_result, item.spend_bundle_name, False, item.program, locked=True
+                )
 
-        potential_txs_copy = self.potential_txs.copy()
-        self.potential_txs = {}
-        txs_added = []
-        for item in potential_txs_copy.values():
-            cost, status, error = await self.add_spendbundle(
-                item.spend_bundle, item.npc_result, item.spend_bundle_name, program=item.program
+            potential_txs_copy = self.potential_txs.copy()
+            self.potential_txs = {}
+            txs_added = []
+            for item in potential_txs_copy.values():
+                cost, status, error = await self.add_spendbundle(
+                    item.spend_bundle, item.npc_result, item.spend_bundle_name, program=item.program, locked=True
+                )
+                if status == MempoolInclusionStatus.SUCCESS:
+                    txs_added.append((item.spend_bundle, item.npc_result, item.spend_bundle_name))
+            log.debug(
+                f"Size of mempool: {len(self.mempool.spends)} spends, cost: {self.mempool.total_mempool_cost} "
+                f"minimum fee to get in: {self.mempool.get_min_fee_rate(100000)}"
             )
-            if status == MempoolInclusionStatus.SUCCESS:
-                txs_added.append((item.spend_bundle, item.npc_result, item.spend_bundle_name))
-        log.debug(
-            f"Size of mempool: {len(self.mempool.spends)} spends, cost: {self.mempool.total_mempool_cost} "
-            f"minimum fee to get in: {self.mempool.get_min_fee_rate(100000)}"
-        )
-        return txs_added
+            return txs_added
 
     async def get_items_not_in_filter(self, mempool_filter: PyBIP158) -> List[MempoolItem]:
         items: List[MempoolItem] = []
